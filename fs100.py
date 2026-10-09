@@ -825,11 +825,12 @@ class FS100:
             axis_data['7th_axis'] = struct.unpack('<i', ans.data[24:28])[0]
         return ans.status
 
-    def read_torque(self, torque_data, robot_no=1):
+    def read_torque(self, torque_data, axes_count=7, robot_no=1):
         """Read the robot torque data of each axis
 
         Args:
             torque_data (dict): Where the robot torque data is stored
+            axes_count (int, optional): How many axes the robot have. Defaults to 7 for backwards compatibility.
             robot_no (int, optional): Robot number. Defaults to 1.
 
         Returns:
@@ -846,10 +847,7 @@ class FS100:
             torque_data['1st_axis'] = struct.unpack('<i', ans.data[0:4])[0]
             torque_data['2nd_axis'] = struct.unpack('<i', ans.data[4:8])[0]
             torque_data['3rd_axis'] = struct.unpack('<i', ans.data[8:12])[0]
-            torque_data['4th_axis'] = struct.unpack('<i', ans.data[12:16])[0]
-            torque_data['5th_axis'] = struct.unpack('<i', ans.data[16:20])[0]
-            torque_data['6th_axis'] = struct.unpack('<i', ans.data[20:24])[0]
-            torque_data['7th_axis'] = struct.unpack('<i', ans.data[24:28])[0]
+            for num in range(4, axes_count + 1): torque_data[f'{num}th_axis'] = struct.unpack('<i', ans.data[(num - 1) * 4:num * 4])[0]
         return ans.status
 
     class VarType(IntEnum):
