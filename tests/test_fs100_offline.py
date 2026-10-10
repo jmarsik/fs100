@@ -104,14 +104,17 @@ class TestFS100Offline(unittest.TestCase):
         self.sim.state.t0 -= 4.0  # sin() negative for some axes
         err = {}
         self.assertEqual(self.robot.read_position_error(err), 0)
-        self.assertEqual(len(err), 8)
+        self.assertEqual(len(err), 6)  # existing axes only, as a live YAS5.10 answers
         self.assertTrue(all(-10 < v < 10 for v in err.values()), err)
 
     def test_torque_default_keys(self):
         tq = {}
         self.assertEqual(self.robot.read_torque(tq), 0)
-        self.assertEqual(list(tq), ['1st_axis', '2nd_axis', '3rd_axis', '4th_axis', '5th_axis', '6th_axis',
-                                    '7th_axis'])
+        # the answer carries the 6 existing axes only (as a live YAS5.10 does)
+        self.assertEqual(list(tq), ['1st_axis', '2nd_axis', '3rd_axis', '4th_axis', '5th_axis', '6th_axis'])
+        base = {}
+        self.assertEqual(self.robot.read_torque(base, robot_no=11), 0)  # 1-axis base: 4 bytes
+        self.assertEqual(list(base), ['1st_axis'])
 
     def test_temperatures_and_regen(self):
         temp = {}

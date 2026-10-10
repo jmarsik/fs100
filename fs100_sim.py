@@ -244,7 +244,10 @@ class FS100Simulator:
                 vals = [int(3000 * math.sin(t / 2 + k)) for k in range(n)]
             else:
                 vals = [35 + k + int(2 * math.sin(t / 10)) for k in range(n)]
-            return ST_OK, 0, struct.pack('<8i', *(vals + [0] * (8 - n)))
+            if cmd == 0x0411:  # live YAS5.10: 8 values, unused axes 0
+                return ST_OK, 0, struct.pack('<8i', *(vals + [0] * (8 - n)))
+            # live YAS5.10: torque / position error carry only the existing axes (6 robot, 1 base)
+            return ST_OK, 0, struct.pack('<{}i'.format(n), *vals)
         if cmd == 0x0412:
             boards = struct.pack('<3i', int(t * 10) % 1000, 812, 123456)
             return ST_OK, 0, struct.pack('<IBBBB', 0x01, 1, 1, 0, 0) + boards + bytes(7 * 12)

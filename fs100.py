@@ -1096,13 +1096,10 @@ class FS100:
         """
         ans = self._robot_cmd("to read the torque data", 0x77, robot_no, 0, 0x01)
         if ans.status == FS100.ERROR_SUCCESS:
-            values = _ints(ans.data)
-            torque_data['1st_axis'] = values[0]
-            torque_data['2nd_axis'] = values[1]
-            torque_data['3rd_axis'] = values[2]
-            # keys '4th_axis' .. '8th_axis' as before
-            for num in range(4, min(axes_count, len(values)) + 1):
-                torque_data[f'{num}th_axis'] = values[num - 1]
+            # The answer carries only the existing axes (6 for a 6-axis robot, 1 for a 1-axis
+            # base: checked on a YRC1000 YAS5.10), so map just what arrived.
+            for key, value in zip(_AXIS_KEYS[:axes_count], _ints(ans.data)):
+                torque_data[key] = value
         return ans.status
 
     def read_encoder_temperature(self, temperature, group=1, axes_count=8):
