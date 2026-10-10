@@ -853,7 +853,7 @@ class FS100:
 
     # ------------------------------------------------------------------ file control
 
-    def _file_transfer(self, what, service, name_or_filter):
+    def _file_transfer(self, what, service, name_or_filter, progress=None):
         """Run a file control session that streams data from the controller (save, list).
 
         Returns (status, data_bytes).
@@ -874,6 +874,8 @@ class FS100:
                 ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
                 while ans.status == FS100.ERROR_SUCCESS:
                     content += ans.data
+                    if progress is not None:
+                        progress(len(content))
                     req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, service,
                                          bytearray(0), 0)
                     # not a request but an ack
@@ -990,18 +992,21 @@ class FS100:
             finally:
                 sock.close()
 
-    def read_file(self, filename):
+    def read_file(self, filename, progress=None):
         """Receive a file from pendant into memory
 
         Args:
             filename (str): Name of the file in pendant, e.g. 'TEST.JBI', 'ALMHIST.DAT' or
                 '/SPDRV/CMOSBK.BIN' for the batch data backup
+            progress (callable, optional): Called with the byte count after every block
+                (one block = up to 479 bytes = one round trip).
 
         Returns:
             tuple: (status, content bytes). status is FS100.ERROR_SUCCESS for success, otherwise
                 failure and errno attribute indicates the error code.
         """
-        return self._file_transfer("receiving the file", 0x16, filename.encode(encoding=FS100.ENCODING))
+        return self._file_transfer("receiving the file", 0x16, filename.encode(encoding=FS100.ENCODING),
+                                   progress)
 
     def recv_file(self, filename, local_dir):
         """Receive a file from pendant

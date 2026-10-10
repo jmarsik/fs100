@@ -126,6 +126,7 @@ class FS100Simulator:
         self._threads = []
         self._file_sessions = {}  # addr -> remaining blocks (list of bytes)
         self.received_files = {}
+        self.file_reads = []  # names requested with service 0x16, for tests
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -405,6 +406,7 @@ class FS100Simulator:
                 return self._start_stream(req, addr, service, content.encode())
             if service == 0x16:
                 name = data.decode('utf-8')
+                self.file_reads.append(name)
                 if name not in st.files:
                     return [_answer(req, service, ST_VENDOR, 0xE2B3)]
                 return self._start_stream(req, addr, service, st.files[name])
