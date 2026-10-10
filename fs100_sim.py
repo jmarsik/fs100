@@ -50,6 +50,21 @@ def _answer(req, service, status=ST_OK, added=0, data=b'', block=LAST):
     return bytes(h) + data
 
 
+def _sc_prm():
+    """SC.PRM with the soft limits (S1C1G800.. robot plus, 810.. minus; S1C2G800/810 base rail)."""
+    def section(name, values):
+        flat = [0] * 816
+        for index, value in values.items():
+            flat[index] = value
+        lines = [','.join(str(v) for v in flat[i:i + 16]) for i in range(0, len(flat), 16)]
+        return '///{}\r\n{}\r\n'.format(name, '\r\n'.join(lines))
+
+    robot = {800: 344064, 801: 191101, 802: 150000, 803: 200000, 804: 250000, 805: 465789,
+             810: -344064, 811: -147000, 812: -100000, 813: -200000, 814: -250000, 815: -465789}
+    base = {800: 388044, 810: -365085}
+    return ('//SC 0\r\n' + section('S1C1G', robot) + section('S1C2G', base) + '///CRC 1234\r\n').encode()
+
+
 class SimState:
     """Controller data the simulator serves. Tests may change it directly."""
 
@@ -107,6 +122,9 @@ class SimState:
             'SYSTEM.SYS': (b'/SYSTEM 8\r\n//DATE      : 2025/04/07 20:22:28\r\n'
                            b'//SYSTEM NO : YAS5.10.00A(EN/CZ)-00\r\n//PARAM  NO : 4.30/4.30\r\n'),
             'ALL.PRM': b'//ALL\r\n' + b'x' * 3000 + b'\r\n',
+            'SC.PRM': _sc_prm(),
+            # the real auto-backup copy is 49833088 bytes; the simulator keeps it small
+            '/SPDRV/CMOSBK.BIN': b'$$Y1.CMOSTYPE' + bytes(range(256)) * 80,
         }
         self.t0 = time.monotonic()
 

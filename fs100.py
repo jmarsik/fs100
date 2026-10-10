@@ -210,6 +210,7 @@ class FS100:
     ERROR_SUCCESS = 0
     ERROR_CONNECTION = 1
     ERROR_NO_SUCH_FILE_OR_DIRECTORY = 2
+    ERROR_CANCELLED = 3  # a file transfer was aborted by its progress callback returning False
 
     # power supply command
     POWER_TYPE_HOLD = 1
@@ -853,8 +854,13 @@ class FS100:
 
     # ------------------------------------------------------------------ file control
 
-    def _file_transfer(self, what, service, name_or_filter, progress=None):
+    def _file_transfer(self, what, service, name_or_filter, progress=None, sink=None):
         """Run a file control session that streams data from the controller (save, list).
+
+        `progress(byte_count)` is called after every block; if it returns False the transfer is
+        aborted: no further ACK is sent (the controller drops the session after its own timeout)
+        and the status is FS100.ERROR_CANCELLED. `sink(chunk)`, when given, receives every block
+        instead of the data being collected in memory (the returned data is then empty).
 
         Returns (status, data_bytes).
         """
@@ -868,14 +874,21 @@ class FS100:
             try:
                 req_id = self._next_req_id()
                 content = bytearray()
+                received = 0
                 data = name_or_filter
                 req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, service,
                                      data, len(data))
                 ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
                 while ans.status == FS100.ERROR_SUCCESS:
-                    content += ans.data
-                    if progress is not None:
-                        progress(len(content))
+                    received += len(ans.data)
+                    if sink is not None:
+                        sink(ans.data)
+                    else:
+                        content += ans.data
+                    if progress is not None and progress(received) is False:
+                        self.errno = 0
+                        log.info("%s cancelled after %d bytes", what, received)
+                        return FS100.ERROR_CANCELLED, bytes(content)
                     req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, service,
                                          bytearray(0), 0)
                     # not a request but an ack
@@ -994,21 +1007,25 @@ class FS100:
             finally:
                 sock.close()
 
-    def read_file(self, filename, progress=None):
-        """Receive a file from pendant into memory
+    def read_file(self, filename, progress=None, sink=None):
+        """Receive a file from pendant into memory (or, with `sink`, chunk by chunk)
 
         Args:
             filename (str): Name of the file in pendant, e.g. 'TEST.JBI', 'ALMHIST.DAT' or
                 '/SPDRV/CMOSBK.BIN' for the batch data backup
             progress (callable, optional): Called with the byte count after every block
-                (one block = up to 479 bytes = one round trip).
+                (one block = up to 479 bytes = one round trip). Returning False aborts the
+                transfer: no more ACKs are sent (the controller drops the session after its own
+                timeout) and the status is FS100.ERROR_CANCELLED.
+            sink (callable, optional): Called with every block's bytes instead of collecting
+                them; the returned content is then empty (for files too big for memory).
 
         Returns:
             tuple: (status, content bytes). status is FS100.ERROR_SUCCESS for success, otherwise
                 failure and errno attribute indicates the error code.
         """
         return self._file_transfer("receiving the file", 0x16, filename.encode(encoding=FS100.ENCODING),
-                                   progress)
+                                   progress, sink)
 
     def recv_file(self, filename, local_dir):
         """Receive a file from pendant

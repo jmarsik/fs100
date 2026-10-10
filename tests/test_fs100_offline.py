@@ -243,6 +243,25 @@ class TestFS100Offline(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(data, self.sim.state.files['ALL.PRM'])
 
+    def test_read_file_abort_and_sink(self):
+        calls = []
+
+        def progress(count):
+            calls.append(count)
+            return count < 1000  # abort in the third block
+
+        status, data = self.robot.read_file('ALL.PRM', progress)
+        self.assertEqual(status, FS100.ERROR_CANCELLED)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(data), calls[-1])
+        # the connection is usable afterwards
+        status, data = self.robot.read_file('ALL.PRM')
+        self.assertEqual((status, data), (0, self.sim.state.files['ALL.PRM']))
+        chunks = []
+        status, data = self.robot.read_file('ALL.PRM', sink=chunks.append)
+        self.assertEqual((status, data), (0, b''))
+        self.assertEqual(b''.join(chunks), self.sim.state.files['ALL.PRM'])
+
     def test_file_commands_use_file_port_when_connected(self):
         self.robot.connect()  # persistent robot control socket must not be reused for files
         files = []
