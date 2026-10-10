@@ -72,7 +72,7 @@ class SimState:
         self.remote = True        # command remote; file commands need it
         self.write_protect = False  # emulates S2C541=1 during play
         self.status = (0x40 | 0x04 | 0x80, 0x40)  # play, auto, command remote / servo on
-        self.job = ('IO_START2', 12, 3, 100)
+        self.job = ('IO_START2', 12, 3, 10000)  # override in 0.01 % (live: 10000)
         self.alarms = [
             (4107, 1, 1, '2026/10/10 08:12', 'OUT OF RANGE(ABSO DATA)', '', '[SLURBT]'),
             (1325, 0, 0, '2026/10/10 08:11', 'COMMUNICATION ERROR(ENCODER)', '[SV#1]', '[1]'),

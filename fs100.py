@@ -151,6 +151,8 @@ class FS100:
             Defaults to 0. File transfers are never retried.
         port_robot_control, port_file_control (int, optional): UDP ports, default 10040 / 10041
             (for simulators and relays).
+        local_port_robot_control, local_port_file_control (int, optional): fixed local (source) UDP
+            ports; default is an ephemeral port. Needed behind udp-over-tcp.
         errno (int): Number of last error (the added status code of the last answer)
 
     Methods:
@@ -325,12 +327,15 @@ class FS100:
     # FS100 objects of one process from talking to the controller at the same time.
     transmission_lock = threading.RLock()
 
-    def __init__(self, ip, timeout=0.8, retries=0, port_robot_control=None, port_file_control=None):
+    def __init__(self, ip, timeout=0.8, retries=0, port_robot_control=None, port_file_control=None,
+                 local_port_robot_control=None, local_port_file_control=None):
         self.ip = ip
         self.timeout = timeout
         self.retries = retries
         self.port_robot_control = port_robot_control or FS100.UDP_PORT_ROBOT_CONTROL
         self.port_file_control = port_file_control or FS100.UDP_PORT_FILE_CONTROL
+        self.local_port_robot_control = local_port_robot_control
+        self.local_port_file_control = local_port_file_control
         self.sock = None
         self._req_id = 0
 
@@ -342,6 +347,11 @@ class FS100:
     def _open_socket(self, port):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(self.timeout)
+        local_port = self.local_port_file_control if port == self.port_file_control else self.local_port_robot_control
+        if local_port:
+            # fixed source port, e.g. for udp-over-tcp, which sends answers to one fixed port
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('', local_port))
         s.connect((self.ip, port))
         return s
 
