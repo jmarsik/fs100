@@ -12,6 +12,7 @@
 
 import argparse
 import math
+import re
 import socket
 import struct
 import threading
@@ -102,7 +103,9 @@ class SimState:
                             b'DATE              :2026/10/10 08:09:00\r\nEVENT             :START\r\n'
                             b'LOGIN NAME        :\r\nTASK              :#08\r\nJOB NAME          :IO_START2\r\n'
                             b'LINE              :0000\r\n\r\n'),
-            'SYSTEM.SYS': b'//SYSTEM\r\n///DATE 2026/10/10 08:00\r\n//SYSTEM NO\r\nYAS5.10.00A(EN/CZ)-00\r\n',
+            # the real file is generated on demand; _file() puts the current time in //DATE
+            'SYSTEM.SYS': (b'/SYSTEM 8\r\n//DATE      : 2025/04/07 20:22:28\r\n'
+                           b'//SYSTEM NO : YAS5.10.00A(EN/CZ)-00\r\n//PARAM  NO : 4.30/4.30\r\n'),
             'ALL.PRM': b'//ALL\r\n' + b'x' * 3000 + b'\r\n',
         }
         self.t0 = time.monotonic()
@@ -409,7 +412,11 @@ class FS100Simulator:
                 self.file_reads.append(name)
                 if name not in st.files:
                     return [_answer(req, service, ST_VENDOR, 0xE2B3)]
-                return self._start_stream(req, addr, service, st.files[name])
+                content = st.files[name]
+                if name == 'SYSTEM.SYS':
+                    content = re.sub(rb'(//DATE      : )[^\r]*',
+                                     lambda m: m.group(1) + time.strftime('%Y/%m/%d %H:%M:%S').encode(), content)
+                return self._start_stream(req, addr, service, content)
             if service == 0x09:
                 return [_answer(req, service, ST_VENDOR, 0xE2AF)]
             if service == 0x15:

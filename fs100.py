@@ -919,18 +919,20 @@ class FS100:
             finally:
                 sock.close()
 
-    def get_file_list(self, extension, list):
+    def get_file_list(self, extension, list, progress=None):
         """Retrieve list of files ended with `extension` in pendant
 
         Args:
             extension (str): Should be '*.JBI', '*.DAT', '*.CND', '*.PRM', '*.SYS' or '*.LST'
             list (list): Where to store the retrieved list
+            progress (callable, optional): Called with the byte count after every block
 
         Returns:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        status, raw = self._file_transfer("getting the file list", 0x32, extension.encode(encoding='ascii'))
+        status, raw = self._file_transfer("getting the file list", 0x32, extension.encode(encoding='ascii'),
+                                           progress)
         if status == FS100.ERROR_SUCCESS:
             # decode once: a multi-byte character may be split across two blocks
             list.extend(raw.decode(FS100.ENCODING, errors='replace').splitlines())
