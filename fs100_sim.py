@@ -115,6 +115,7 @@ class FS100Simulator:
         self.state = state or SimState()
         self.stale_reply = False  # when True, every answer is preceded by one with a wrong request ID
         self.drop_next = 0        # drop this many requests without answering
+        self.delay = 0.0          # seconds to wait before answering (slow link)
         self.sock_robot = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock_robot.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock_robot.bind((host, port_robot))
@@ -168,6 +169,8 @@ class FS100Simulator:
             except Exception as e:  # keep serving; report as system error
                 answers = [_answer(req, req[29] if len(req) > 29 else 0, ST_VENDOR, 0xCFFF)]
                 print('simulator error:', repr(e))
+            if self.delay:
+                time.sleep(self.delay)
             for ans in answers or []:
                 if self.stale_reply:
                     bad = bytearray(ans)

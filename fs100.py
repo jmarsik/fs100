@@ -349,9 +349,14 @@ class FS100:
         s.settimeout(self.timeout)
         local_port = self.local_port_file_control if port == self.port_file_control else self.local_port_robot_control
         if local_port:
-            # fixed source port, e.g. for udp-over-tcp, which sends answers to one fixed port
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('', local_port))
+            # fixed source port, e.g. for udp-over-tcp, which sends answers to one fixed port.
+            # No SO_REUSEADDR: a second client on the same port must fail ("address in use")
+            # instead of silently receiving some of the other client's answers.
+            try:
+                s.bind(('', local_port))
+            except OSError:
+                s.close()
+                raise
         s.connect((self.ip, port))
         return s
 
