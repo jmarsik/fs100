@@ -10,13 +10,22 @@
 # Authors:
 #    Hsinko Yu <hsinkoyu@fih-foxconn.com>
 #
+# Also works with the YRC1000. Command layouts were checked against the
+# YRC1000 Ethernet function manual HW1483358 rev 11, chapter 3 ("High-Speed
+# Ethernet Server Function"); page references below are PDF pages of that
+# manual.
+#
 
+import logging
 import ntpath
 import os
 import socket
 import struct
 import threading
+import time
 from enum import IntEnum
+
+log = logging.getLogger('fs100')
 
 
 # common header excluding sub-header
@@ -91,6 +100,8 @@ class FS100ReqPacket(FS100PacketHeader):
 class FS100AnsPacket(FS100PacketHeader):
 
     def __init__(self, packet):
+        if len(packet) < FS100PacketHeader.HEADER_SIZE:
+            raise ValueError('answer packet too short ({} bytes)'.format(len(packet)))
         FS100PacketHeader.__init__(self, packet)
         self.service = struct.unpack('B', packet[24:25])[0]
         self.status = struct.unpack('B', packet[25:26])[0]
@@ -111,17 +122,36 @@ class FS100AnsPacket(FS100PacketHeader):
         return h
 
 
+def _cstr(raw, encoding=None):
+    """Decode a NUL-padded controller string."""
+    return bytes(raw).split(b'\x00', 1)[0].decode(encoding or FS100.ENCODING, errors='replace')
+
+
+_AXIS_KEYS = ('1st_axis', '2nd_axis', '3rd_axis', '4th_axis', '5th_axis', '6th_axis', '7th_axis', '8th_axis')
+
+
+def _ints(raw, signed=True, count=None):
+    """Unpack consecutive little-endian 32-bit integers."""
+    n = len(raw) // 4 if count is None else min(count, len(raw) // 4)
+    return list(struct.unpack('<{}{}'.format(n, 'i' if signed else 'I'), bytes(raw[:n * 4])))
+
+
 class FS100:
     """YASKAWA FS100 High Speed Ethernet Server Functions
 
     This class implements most of YASKAWA FS100 High Speed Ethernet Server Functions.
     https://www.motoman.com/getmedia/16B5CD92-BD0B-4DE0-9DC9-B71D0B6FE264/160766-1CD.pdf.aspx?ext=.pdf
+    It works with the YRC1000 too (manual HW1483358, chapter 3).
 
     Attributes:
         ip (str): IP address of the controller
         timeout (int, optional): Communication timeout value in second between PC and Controller.
             Defaults to 0.8.
-        errno (int): Number of last error
+        retries (int, optional): How many times a robot control request is resent after a timeout.
+            Defaults to 0. File transfers are never retried.
+        port_robot_control, port_file_control (int, optional): UDP ports, default 10040 / 10041
+            (for simulators and relays).
+        errno (int): Number of last error (the added status code of the last answer)
 
     Methods:
         switch_power(): Turn on/off the power supply
@@ -138,19 +168,36 @@ class FS100:
         read_variable(): Read a robot variable
         read_variables(): Read multiple robot variable with plural commands
         write_variable(): Write a robot variable
+        write_variables(): Write multiple robot variables with plural commands
         get_status(): Retrieve various status of the robot
-        read_alarm_info(): Retrieve info of the specified alarm
+        read_alarm_info(): Retrieve info of the specified alarm (alarm history)
+        read_alarm_history(): Retrieve all entries of one alarm history category
         get_last_alarm(): Retrieve info of the latest alarm
+        read_alarm(): Retrieve info of one of the up to four current alarms
+        read_alarms(): Retrieve info of all current alarms
+        read_alarm_ex(): Like read_alarm(), with the sub code character strings
+        read_alarm_info_ex(): Like read_alarm_info(), with the sub code character strings
         reset_alarm(): To reset alarms or cancel errors
         acquire_system_info(): Acquire system information
         acquire_management_time(): Acquire usage time of an action
+        read_encoder_temperature(): Read the encoder temperature of each axis (YAS4.81 and later)
+        read_regenerative_power(): Read the amount of regenerative power (YAS4.90 and later)
+        read_converter_temperature(): Read the converter temperature (YAS5.20 and later)
         show_text_on_pendant(): Show text on pendant
         get_file_list(): Retrieve list of files ended with extension in pendant
         send_file(): Send a local file to pendant
         recv_file(): Receive a file from pendant
+        read_file(): Receive a file from pendant into memory
         delete_file(): Delete a file in pendant
+        request(): Send any robot control command and return the raw answer
+        describe_error(): Human readable text for a status / added status pair
     """
     DEBUG = False
+
+    # Encoding of strings coming from the controller (alarm names, job names, S variables).
+    # The controller sends them in the language selected on the programming pendant
+    # (manual p. 76), so this has to match that setting for non-ASCII text.
+    ENCODING = 'utf-8'
 
     UDP_PORT_ROBOT_CONTROL = 10040
     UDP_PORT_FILE_CONTROL = 10041
@@ -190,22 +237,122 @@ class FS100:
     RESET_ALARM_TYPE_ALARM = 1
     RESET_ALARM_TYPE_ERROR = 2
 
+    # status codes of the answer sub-header (manual p. 168)
+    STATUS_TEXT = {
+        0x00: 'success',
+        0x08: 'requested command is not defined',
+        0x09: 'invalid element number',
+        0x1f: 'vendor specific error (see added status)',
+        0x28: 'requested instance does not exist',
+    }
+
+    # added status codes (manual pp. 169-172)
+    ADDED_STATUS_TEXT = {
+        0x1010: 'Command error', 0x1011: 'Error in number of command operands',
+        0x1012: 'Command operand value range over', 0x1013: 'Command operand length error',
+        0x1020: 'Disk full of files', 0x2010: 'Manipulator operating', 0x2020: 'Hold by programming pendant',
+        0x2030: 'Hold by playback panel', 0x2040: 'External hold', 0x2050: 'Command hold',
+        0x2060: 'Error/alarm occurring', 0x2070: 'Servo OFF', 0x2080: 'Incorrect mode',
+        0x2090: 'File accessing by other function', 0x2100: 'Command remote not set',
+        0x2110: 'This data cannot be accessed', 0x2120: 'This data cannot be loaded', 0x2130: 'Editing',
+        0x2150: 'Running the coordinate conversion function', 0x3010: 'Turn ON the servo power',
+        0x3040: 'Perform home positioning', 0x3050: 'Confirm positions', 0x3070: 'Current value not made',
+        0x3220: 'Panel lock; mode/cycle prohibit signal is ON', 0x3230: 'Panel lock; start prohibit signal is ON',
+        0x3350: 'User coordinate is not taught', 0x3360: 'User coordinate is destroyed',
+        0x3370: 'Incorrect control group', 0x3380: 'Incorrect base axis data',
+        0x3390: 'Relative job conversion prohibited (at CVTRJ)', 0x3400: 'Master job call prohibited (parameter)',
+        0x3410: 'Master job call prohibited (lamp ON during operation)',
+        0x3420: 'Master job call prohibited (teach lock)', 0x3430: 'Robot calibration data not defined',
+        0x3450: 'Servo power cannot be turned ON', 0x3460: 'Coordinate system cannot be set',
+        0x4010: 'Insufficient memory capacity (job registered memory)',
+        0x4012: 'Insufficient memory capacity (position data registered memory)',
+        0x4020: 'Job editing prohibited', 0x4030: 'Same job name exists', 0x4040: 'No specified job',
+        0x4060: 'Set an execution job', 0x4120: 'Position data is destroyed', 0x4130: 'Position data not exist',
+        0x4140: 'Incorrect position variable type', 0x4150: 'END instruction for job which is not master job',
+        0x4170: 'Instruction data is destroyed', 0x4190: 'Invalid character in job name',
+        0x4200: 'Invalid character in the label name', 0x4230: 'Invalid instruction in this system',
+        0x4420: 'No step in job to be converted', 0x4430: 'Already converted', 0x4480: 'Teach user coordinate',
+        0x4490: 'Relative job/ independent control function not permitted',
+        0x5110: 'Syntax error (syntax of instruction)', 0x5120: 'Position data error', 0x5130: 'No NOP or END',
+        0x5170: 'Format error (incorrect format)', 0x5180: 'Incorrect number of data', 0x5200: 'Data range over',
+        0x5310: 'Syntax error (except instruction)', 0x5340: 'Error in pseudo instruction specification',
+        0x5370: 'Error in condition file data record', 0x5390: 'Error in JOB data record',
+        0x5430: 'System data not same', 0x5480: 'Incorrect welding function type',
+        0x6010: 'The robot/station is under the operation', 0x6020: 'Not enough memory of the specified device',
+        0x6030: 'Cannot be accessed to the specified device', 0x6040: 'Unexpected auto backup request',
+        0x6050: 'CMOS size is over the RAM area', 0x6060: 'No memory allocation at the power supply on',
+        0x6070: 'Accessing error to backup file information', 0x6080: 'Failed in sorting backup file (Remove)',
+        0x6090: 'Failed in sorting backup file (Rename)', 0x6100: 'Drive name exceeds the specified values',
+        0x6110: 'Incorrect device', 0x6120: 'System error', 0x6130: 'Auto backup is not available',
+        0x6140: 'Cannot be backed up under the auto backup', 0xA000: 'Undefined command', 0xA001: 'Instance error',
+        0xA002: 'Attribute error', 0xA100: 'Replying data part size error (hardware limit)',
+        0xA101: 'Replying data part size error (software limit)', 0xB001: 'Undefined position variable',
+        0xB002: 'Data use prohibited', 0xB003: 'Requiring data size error', 0xB004: 'Out of range the data',
+        0xB005: 'Data undefined', 0xB006: 'Specified application unregistered',
+        0xB007: 'Specified type unregistered', 0xB008: 'Control group setting error', 0xB009: 'Speed setting error',
+        0xB00A: 'Operating speed is not setting', 0xB00B: 'Operation coordinate system setting error',
+        0xB00C: 'Type setting error', 0xB00D: 'Tool No. setting error', 0xB00E: 'User No. setting error',
+        0xC001: 'System error (data area setting processing error)',
+        0xC002: 'System error (over the replying data area)',
+        0xC003: 'System error (size of the data element not same)',
+        0xC800: 'System error (customize API processing error), e.g. write during play with S2C541=1',
+        0xCFFF: 'Other error', 0xD8FA: 'Transmission exclusive error (BUSY or Semaphore error)',
+        0xD8F1: 'Processing the another command (BUSY condition)',
+        0xE24F: 'Wrong parameter setting for the system backup',
+        0xE250: 'System backup file creating error (confirm if the mode is the remote mode)',
+        0xE289: 'System error', 0xE28A: 'System error', 0xE28B: 'Disconnect the communication due to receive timeout',
+        0xE28C: 'Cannot over write the target file', 0xE29C: 'The requested file does not exist or the file size is 0',
+        0xE29D: 'System error', 0xE29E: 'System error', 0xE29F: 'System error', 0xE2A0: 'The wrong required pass',
+        0xE2A7: 'The relevant file is not in the requested file list', 0xE2AA: 'System error',
+        0xE2AF: 'Receive the deletion request of the file that cannot to delete', 0xE2B0: 'System error',
+        0xE2B1: 'The directory cannot to be deleted',
+        0xE2B2: 'Receive the request of the sending/receiving file at the remote OFF state',
+        0xE2B3: 'File not found', 0xE2B4: 'The requested pass is too long',
+        0xE444: 'Processing the another command (BUSY condition)', 0xE49D: 'Format error (data size 0)',
+        0xE49E: 'Format error (frame size over)', 0xE49F: 'Format error (frame size 0)',
+        0xE4A1: 'Format error (block number error)', 0xE4A2: 'Format error (ACK error)',
+        0xE4A3: 'Format error (processing category error)', 0xE4A4: 'Format error (access level error)',
+        0xE4A5: 'Format error (header size error)', 0xE4A6: 'Format error (identifier error)',
+        0xE4A7: 'Format error (the size of the requested command and received frame are different)',
+        0xE4A8: 'System error', 0xE4A9: 'System error', 0xFFF0: 'System error', 0xFFF2: 'System error',
+        0xFFF3: 'System error', 0xFFF4: 'System error', 0xFFF5: 'System error',
+        0xFFF6: 'Too many request and unable to process (BUSY condition)', 0xFFF7: 'System error',
+        0xFFF8: 'System error', 0xFFFE: 'The remote mode is detected, and disconnect the communication',
+    }
+
     # threading safe lock
+    # It is shared by all instances on purpose (existing behaviour): it also keeps different
+    # FS100 objects of one process from talking to the controller at the same time.
     transmission_lock = threading.RLock()
 
-    def __init__(self, ip, timeout=0.8):
+    def __init__(self, ip, timeout=0.8, retries=0, port_robot_control=None, port_file_control=None):
         self.ip = ip
         self.timeout = timeout
+        self.retries = retries
+        self.port_robot_control = port_robot_control or FS100.UDP_PORT_ROBOT_CONTROL
+        self.port_file_control = port_file_control or FS100.UDP_PORT_FILE_CONTROL
         self.sock = None
+        self._req_id = 0
 
         # number of last error
         self.errno = 0
 
-    def connect(self, port=UDP_PORT_ROBOT_CONTROL):
+    # ------------------------------------------------------------------ transport
+
+    def _open_socket(self, port):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(self.timeout)
+        s.connect((self.ip, port))
+        return s
+
+    def connect(self, port=None):
+        """Open the robot control socket and keep it open until disconnect().
+
+        Without connect(), every request opens and closes its own socket.
+        File control commands always use their own socket on the file control port.
+        """
         if self.sock is None:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.settimeout(self.timeout)
-            self.sock.connect((self.ip, port))
+            self.sock = self._open_socket(port or self.port_robot_control)
 
     def disconnect(self):
         if self.sock is not None:
@@ -215,53 +362,121 @@ class FS100:
     def connected(self):
         return self.sock is not None
 
+    def _next_req_id(self):
+        # The manual asks to increment the request ID for every new command (p. 57). The answer
+        # echoes it, which lets transmit() drop late answers to earlier, timed-out requests.
+        with FS100.transmission_lock:
+            self._req_id = (self._req_id + 1) & 0xff
+            return self._req_id
+
     def generate_error_ans_packet(self, result, errno):
         # when error, result and error number are what callers care about
         p = bytearray(25)
         p += struct.pack('B', result)
         p += bytearray(2)
-        p += struct.pack('<H', errno)
+        p += struct.pack('<H', errno & 0xffff)
         p += bytearray(2)
         return p
 
-    def transmit(self, packet, direction=TRANSMISSION_SEND_AND_RECV):
+    def transmit(self, packet, direction=TRANSMISSION_SEND_AND_RECV, sock=None, retries=None):
+        """Send one request packet and return the matching answer (FS100AnsPacket).
+
+        Answers whose request ID or processing division do not match the request are
+        discarded (they belong to earlier requests that timed out). On a timeout or a
+        socket error an answer with status ERROR_CONNECTION is returned.
+        `sock` is used by the file control commands, which run on their own socket.
+        """
         # transmission_lock is a reentrant lock. Owning thread may acquire it again without blocking.
         # This prevents sending robot control command during file control transmission.
-        FS100.transmission_lock.acquire()
-
-        if self.connected():
+        with FS100.transmission_lock:
             to_disc = False
-        else:
-            self.connect()
-            to_disc = True
+            if sock is None:
+                if not self.connected():
+                    self.connect()
+                    to_disc = True
+                sock = self.sock
+            try:
+                retries = self.retries if retries is None else retries
+                for attempt in range(retries + 1):
+                    ans = self._send_recv(sock, bytes(packet), direction)
+                    if ans is None or ans.status != FS100.ERROR_CONNECTION or ans.added_status != FS100.ERROR_CONNECTION:
+                        return ans
+                    if attempt < retries:
+                        log.warning("timeout, resending request (attempt %d/%d)", attempt + 2, retries + 1)
+                return ans
+            finally:
+                if to_disc:
+                    self.disconnect()
 
+    def _send_recv(self, sock, packet, direction):
+        division = packet[9]
+        req_id = packet[11]
         try:
-            self.sock.sendall(packet)
+            sock.send(packet)
             if FS100.DEBUG:
                 print("PC -> FS100: {}, Len={}".format(packet, len(packet)))
-            if direction == FS100.TRANSMISSION_SEND_AND_RECV:
-                ans_packet, addr = self.sock.recvfrom(512)
+            log.debug("PC -> FS100: %s", packet.hex())
+            if direction != FS100.TRANSMISSION_SEND_AND_RECV:
+                return None
+            deadline = time.monotonic() + self.timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout('timed out')
+                sock.settimeout(remaining)
+                ans_packet = sock.recv(2048)
                 if FS100.DEBUG:
                     print("PC <- FS100: {}, Len={}".format(ans_packet, len(ans_packet)))
+                log.debug("PC <- FS100: %s", ans_packet.hex())
+                if len(ans_packet) < FS100PacketHeader.HEADER_SIZE or ans_packet[0:4] != b'YERC':
+                    log.warning("ignoring malformed answer (%d bytes)", len(ans_packet))
+                    continue
+                if ans_packet[11] != req_id or ans_packet[9] != division:
+                    log.info("ignoring stale answer (request id %d, expected %d)", ans_packet[11], req_id)
+                    continue
+                return FS100AnsPacket(ans_packet)
         except socket.error as error:
-            print("ConnectionError: {}".format(error))
+            log.warning("ConnectionError: %s", error)
             errno = error.errno
             if errno is None:
                 errno = FS100.ERROR_CONNECTION
-            ans_packet = self.generate_error_ans_packet(FS100.ERROR_CONNECTION, errno)
-        finally:
-            pass
+            return FS100AnsPacket(self.generate_error_ans_packet(FS100.ERROR_CONNECTION, errno))
 
-        if direction == FS100.TRANSMISSION_SEND_AND_RECV:
-            ans = FS100AnsPacket(ans_packet)
-        else:
-            ans = None
+    @staticmethod
+    def describe_error(status, added_status=0):
+        """Return a human readable text for an answer status and added status."""
+        if status == FS100.ERROR_SUCCESS:
+            return FS100.STATUS_TEXT[0]
+        if status == FS100.ERROR_CONNECTION:
+            # not an HSE status: set by transmit() when no answer arrived
+            if added_status in (0, FS100.ERROR_CONNECTION):
+                return 'no answer (timeout or connection error)'
+            return 'connection error: {} (errno {})'.format(os.strerror(added_status), added_status)
+        text = FS100.STATUS_TEXT.get(status, 'status 0x{:02x}'.format(status))
+        if added_status:
+            text += ': {} (0x{:04X})'.format(FS100.ADDED_STATUS_TEXT.get(added_status, 'unknown'), added_status)
+        return text
 
-        if to_disc:
-            self.disconnect()
+    def request(self, cmd_no, inst, attr, service, data=b''):
+        """Send a robot control command and return the answer packet (FS100AnsPacket).
 
-        FS100.transmission_lock.release()
+        Sets errno. The caller checks ans.status and parses ans.data.
+        """
+        data = bytes(data)
+        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, self._next_req_id(), cmd_no, inst,
+                             attr, service, data, len(data))
+        ans = self.transmit(req.to_bytes())
+        self.errno = ans.added_status
         return ans
+
+    def _robot_cmd(self, what, cmd_no, inst, attr, service, data=b''):
+        ans = self.request(cmd_no, inst, attr, service, data)
+        if ans.status != FS100.ERROR_SUCCESS:
+            log.warning("failed %s, err=%s (%s)", what, hex(ans.added_status),
+                        FS100.describe_error(ans.status, ans.added_status))
+        return ans
+
+    # ------------------------------------------------------------------ control commands
 
     def switch_power(self, power_type, switch):
         """Turn on/off the power supply
@@ -279,13 +494,8 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x83, power_type, 0x01, 0x10,
-                             struct.pack('<I', switch), 4)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed switching power supply, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("switching power supply", 0x83, power_type, 0x01, 0x10,
+                               struct.pack('<I', switch)).status
 
     def select_cycle(self, cycle_type):
         """Select the way a job in pendant plays
@@ -304,13 +514,7 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x84, 2, 0x01, 0x10,
-                             struct.pack('<I', cycle_type), 4)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed to select cycle, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("to select cycle", 0x84, 2, 0x01, 0x10, struct.pack('<I', cycle_type)).status
 
     def mov(self, move_type, coordinate, speed_class, speed, pos, form=0, extended_form=0, robot_no=1,
                  station_no=0, tool_no=0, user_coor_no=0):
@@ -359,14 +563,7 @@ class FS100:
         data += struct.pack('<I', tool_no)
         data += struct.pack('<I', user_coor_no)
         data += bytearray(36)
-
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x8a, move_type, 0x01, 0x02, data,
-                             len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed moving to the target position, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("moving to the target position", 0x8a, move_type, 0x01, 0x02, data).status
 
     def pmov(self, move_type, speed_class, speed, pulse, robot_no=1, station_no=0, tool_no=0):
         """Make robot move to a specified pulse position
@@ -400,13 +597,36 @@ class FS100:
         data += struct.pack('<I', 0)  # reserved
         data += struct.pack('<I', tool_no)
         data += bytearray(36)
+        return self._robot_cmd("moving to the target position", 0x8b, move_type, 0x01, 0x02, data).status
 
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x8b, move_type, 0x01, 0x02, data,
-                             len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed moving to the target position, err={}".format(hex(ans.added_status)))
+    # ------------------------------------------------------------------ alarms
+
+    def _parse_alarm(self, data, alarm, extended=False):
+        alarm['code'] = struct.unpack('<I', data[0:4])[0]
+        alarm['data'] = struct.unpack('<I', data[4:8])[0]
+        alarm['type'] = struct.unpack('<I', data[8:12])[0]
+        alarm['time'] = _cstr(data[12:28], 'ascii')
+        alarm['name'] = _cstr(data[28:60])
+        if extended:
+            # 0x30A / 0x30B answers (manual pp. 130, 133)
+            alarm['subcode_info'] = _cstr(data[60:76])
+            alarm['subcode_text'] = _cstr(data[76:172])
+            alarm['subcode_reverse'] = _cstr(data[172:268])
+
+    def read_alarm(self, index, alarm):
+        """Retrieve info of one of the current alarms (up to four are shown on the pendant)
+
+        Args:
+            index (int): 1 for the latest alarm, 2 to 4 for the older ones
+            alarm (dict): Where the retrieved info is written to (code, data, type, time, name)
+
+        Returns:
+            int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
+                indicates the error code.
+        """
+        ans = self._robot_cmd("getting alarm {}".format(index), 0x70, index, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            self._parse_alarm(ans.data, alarm)
         return ans.status
 
     def get_last_alarm(self, alarm):
@@ -419,18 +639,46 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x70, 1, 0, 0x01, bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed getting the last alarm, err={}".format(hex(ans.added_status)))
-        else:
-            alarm['code'] = struct.unpack('<I', ans.data[0:4])[0]
-            alarm['data'] = struct.unpack('<I', ans.data[4:8])[0]
-            alarm['type'] = struct.unpack('<I', ans.data[8:12])[0]
-            alarm['time'] = ans.data[12:28].decode('ascii').rstrip('\x00')
-            alarm['name'] = ans.data[28:60].decode('utf-8').rstrip('\x00')
+        return self.read_alarm(1, alarm)
+
+    def read_alarm_ex(self, index, alarm):
+        """Like read_alarm(), but also returns the sub code character strings (command 0x30A)
+
+        Adds keys subcode_info (e.g. '[SV#1]'), subcode_text (e.g. '[SLURBT]') and
+        subcode_reverse (which characters the pendant shows reversed).
+        """
+        ans = self._robot_cmd("getting alarm {}".format(index), 0x30a, index, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            self._parse_alarm(ans.data, alarm, extended=True)
         return ans.status
+
+    def read_alarms(self, alarms, extended=True):
+        """Retrieve all current alarms (up to four)
+
+        Args:
+            alarms (list): Where the alarms (dicts) are appended, latest first. Empty slots
+                (alarm code 0) are left out.
+            extended (bool, optional): Use command 0x30A with the sub code strings. Defaults to True.
+
+        Returns:
+            int: FS100.ERROR_SUCCESS for success, otherwise the status of the first failed read.
+        """
+        for index in range(1, 5):
+            alarm = dict()
+            ret = self.read_alarm_ex(index, alarm) if extended else self.read_alarm(index, alarm)
+            if ret != FS100.ERROR_SUCCESS:
+                return ret
+            if alarm['code'] == 0:
+                break
+            alarms.append(alarm)
+        return FS100.ERROR_SUCCESS
+
+    class AlarmHistoryType(IntEnum):
+        MAJOR = 1
+        MINOR = 1001
+        USER_SYSTEM = 2001
+        USER = 3001
+        OFFLINE = 4001
 
     def read_alarm_info(self, alarm_num, alarm_info):
         """Retrieve info of the specified alarm
@@ -447,18 +695,40 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x71, alarm_num, 0, 0x01, bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed to read the alarm info, err={}".format(hex(ans.added_status)))
-        else:
-            alarm_info['code'] = struct.unpack('<I', ans.data[0:4])[0]
-            alarm_info['data'] = struct.unpack('<I', ans.data[4:8])[0]
-            alarm_info['type'] = struct.unpack('<I', ans.data[8:12])[0]
-            alarm_info['time'] = ans.data[12:28].decode('ascii').rstrip('\x00')
-            alarm_info['name'] = ans.data[28:60].decode('utf-8').rstrip('\x00')
+        ans = self._robot_cmd("to read the alarm info", 0x71, alarm_num, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            self._parse_alarm(ans.data, alarm_info)
         return ans.status
+
+    def read_alarm_info_ex(self, alarm_num, alarm_info):
+        """Like read_alarm_info(), but also returns the sub code character strings (command 0x30B)"""
+        ans = self._robot_cmd("to read the alarm info", 0x30b, alarm_num, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            self._parse_alarm(ans.data, alarm_info, extended=True)
+        return ans.status
+
+    def read_alarm_history(self, history_type, history, extended=True, max_count=100):
+        """Retrieve the entries of one alarm history category
+
+        Args:
+            history_type (FS100.AlarmHistoryType): Category (its first alarm number)
+            history (list): Where the entries (dicts, with an extra key 'num') are appended,
+                newest first. Reading stops at the first empty entry (alarm code 0).
+            extended (bool, optional): Use command 0x30B with the sub code strings. Defaults to True.
+            max_count (int, optional): How many entries to read at most (1 to 100). Defaults to 100.
+
+        Returns:
+            int: FS100.ERROR_SUCCESS for success, otherwise the status of the failed read.
+        """
+        for num in range(int(history_type), int(history_type) + max_count):
+            entry = {'num': num}
+            ret = self.read_alarm_info_ex(num, entry) if extended else self.read_alarm_info(num, entry)
+            if ret != FS100.ERROR_SUCCESS:
+                return ret
+            if entry['code'] == 0:
+                break
+            history.append(entry)
+        return FS100.ERROR_SUCCESS
 
     def reset_alarm(self, alarm_type):
         """To reset alarms or cancel errors
@@ -472,13 +742,10 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x82, alarm_type, 1, 0x10,
-                             struct.pack('<I', 1), 4)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed resetting alarms or cancelling errors, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("resetting alarms or cancelling errors", 0x82, alarm_type, 1, 0x10,
+                               struct.pack('<I', 1)).status
+
+    # ------------------------------------------------------------------ status
 
     def get_status(self, status):
         """Retrieve various status of the robot
@@ -490,47 +757,44 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x72, 1, 0, 0x01, bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed getting the status, err={}".format(hex(ans.added_status)))
-        else:
+        ans = self._robot_cmd("getting the status", 0x72, 1, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
             data_1 = struct.unpack('<I', ans.data[0:4])[0]
             data_2 = struct.unpack('<I', ans.data[4:8])[0]
             status['step'] = bool(data_1 & 0x01)
             status['one_cycle'] = bool(data_1 & 0x02)
             status['auto_and_cont'] = bool(data_1 & 0x04)
             status['running'] = bool(data_1 & 0x08)
+            # The YRC1000 manual calls bit 4 "Speed Limit" (p. 80); kept the old key too.
             status['guard_safe'] = bool(data_1 & 0x10)
+            status['speed_limit'] = bool(data_1 & 0x10)
             status['teach'] = bool(data_1 & 0x20)
             status['play'] = bool(data_1 & 0x40)
             status['cmd_remote'] = bool(data_1 & 0x80)
             status['hold_by_pendant'] = bool(data_2 & 0x02)
+            # Data 2 bit 2 is blank in the YRC1000 manual (p. 80); FS100 named it external hold.
             status['hold_externally'] = bool(data_2 & 0x04)
             status['hold_by_cmd'] = bool(data_2 & 0x08)
             status['alarming'] = bool(data_2 & 0x10)
             status['error_occurring'] = bool(data_2 & 0x20)
             status['servo_on'] = bool(data_2 & 0x40)
+            status['raw'] = (data_1, data_2)
         return ans.status
 
-    def read_executing_job_info(self, info):
+    def read_executing_job_info(self, info, task=0):
         """Read the info of executing job
 
         Args:
             info (dict): Where the job info is stored
+            task (int, optional): 0 for the master task, 1 to 15 for the sub tasks. Defaults to 0.
 
         Returns:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x73, 1, 0, 0x01, bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed to read the info of executing job, err={}".format(hex(ans.added_status)))
-        else:
-            info['job_name'] = ans.data[0:32].decode('utf-8').rstrip('\x00')
+        ans = self._robot_cmd("to read the info of executing job", 0x73, task + 1, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            info['job_name'] = _cstr(ans.data[0:32])
             info['line_num'] = struct.unpack('<I', ans.data[32:36])[0]
             info['step_num'] = struct.unpack('<I', ans.data[36:40])[0]
             info['speed_override_value'] = struct.unpack('<I', ans.data[40:44])[0]
@@ -546,13 +810,7 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x86, 1, 1, 0x10,
-                             struct.pack('<I', 1), 4)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed playing job, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("playing job", 0x86, 1, 1, 0x10, struct.pack('<I', 1)).status
 
     def select_job(self, job_name, line_num=0):
         """Select a job in pendant for later playing
@@ -570,17 +828,55 @@ class FS100:
         """
         if job_name.upper().endswith('.JBI'):
             job_name = job_name[:-4]
-        data = job_name.encode(encoding='utf-8')
+        data = job_name.encode(encoding=FS100.ENCODING)
         if len(data) > 32:
             raise ValueError('Job name is too long')
         data += bytearray(32 - len(data))
         data += struct.pack('<I', line_num)
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x87, 1, 0, 0x02, data, len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed selecting the job, err={}".format(hex(ans.added_status)))
-        return ans.status
+        # NOTE: the YRC1000 manual says attribute "fixed to 1" (p. 109); this sends 0 as it always did.
+        return self._robot_cmd("selecting the job", 0x87, 1, 0, 0x02, data).status
+
+    # ------------------------------------------------------------------ file control
+
+    def _file_transfer(self, what, service, name_or_filter):
+        """Run a file control session that streams data from the controller (save, list).
+
+        Returns (status, data_bytes).
+        """
+        with FS100.transmission_lock:
+            try:
+                sock = self._open_socket(self.port_file_control)
+            except OSError as error:
+                log.warning("ConnectionError: %s", error)
+                self.errno = FS100.ERROR_CONNECTION
+                return FS100.ERROR_CONNECTION, b''
+            try:
+                req_id = self._next_req_id()
+                content = bytearray()
+                data = name_or_filter
+                req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, service,
+                                     data, len(data))
+                ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
+                while ans.status == FS100.ERROR_SUCCESS:
+                    content += ans.data
+                    req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, service,
+                                         bytearray(0), 0)
+                    # not a request but an ack
+                    req.ack = FS100PacketHeader.HEADER_ACK_NOT_REQUEST
+                    req.block_no = ans.block_no
+                    if ans.block_no & 0x80000000 != 0:
+                        # The last piece arrived. Send the final ack.
+                        self.transmit(req.to_bytes(), FS100.TRANSMISSION_SEND, sock=sock, retries=0)
+                        break
+                    else:
+                        ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
+                self.errno = ans.added_status
+                if ans.status != FS100.ERROR_SUCCESS:
+                    log.warning("failed %s, err=%s (%s)", what, hex(ans.added_status),
+                                FS100.describe_error(ans.status, ans.added_status))
+                return ans.status, bytes(content)
+            finally:
+                sock.close()
 
     def delete_file(self, file_name):
         """Delete a file in pendant
@@ -592,17 +888,19 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        self.transmission_lock.acquire()
-        self.connect(FS100.UDP_PORT_FILE_CONTROL)
-        data = file_name.encode(encoding='utf-8')
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x09, data, len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed deleting the file, err={}".format(hex(ans.added_status)))
-        self.disconnect()
-        self.transmission_lock.release()
-        return ans.status
+        with FS100.transmission_lock:
+            sock = self._open_socket(self.port_file_control)
+            try:
+                data = file_name.encode(encoding=FS100.ENCODING)
+                req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, self._next_req_id(), 0, 0, 0,
+                                     0x09, data, len(data))
+                ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
+                self.errno = ans.added_status
+                if ans.status != FS100.ERROR_SUCCESS:
+                    log.warning("failed deleting the file, err=%s", hex(ans.added_status))
+                return ans.status
+            finally:
+                sock.close()
 
     def get_file_list(self, extension, list):
         """Retrieve list of files ended with `extension` in pendant
@@ -615,32 +913,11 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        self.transmission_lock.acquire()
-        self.connect(FS100.UDP_PORT_FILE_CONTROL)
-        raw = ''
-        data = extension.encode(encoding='ascii')
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x32, data, len(data))
-        ans = self.transmit(req.to_bytes())
-        while ans.status == FS100.ERROR_SUCCESS:
-            raw += ans.data.decode('utf-8')
-            req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x32, bytearray(0), 0)
-            # not a request but an ack
-            req.ack = FS100PacketHeader.HEADER_ACK_NOT_REQUEST
-            req.block_no = ans.block_no
-            if ans.block_no & 0x80000000 != 0:
-                # The last file list data arrived. Send the final ack.
-                self.transmit(req.to_bytes(), FS100.TRANSMISSION_SEND)
-                break
-            else:
-                ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed getting the file list, err={}".format(hex(ans.added_status)))
-        else:
-            list.extend(raw.splitlines())
-        self.disconnect()
-        self.transmission_lock.release()
-        return ans.status
+        status, raw = self._file_transfer("getting the file list", 0x32, extension.encode(encoding='ascii'))
+        if status == FS100.ERROR_SUCCESS:
+            # decode once: a multi-byte character may be split across two blocks
+            list.extend(raw.decode(FS100.ENCODING, errors='replace').splitlines())
+        return status
 
     def send_file(self, filename):
         """Send a local file to pendant
@@ -659,42 +936,57 @@ class FS100:
             with open(filename, 'rb') as f:
                 context = f.read()
         except FileNotFoundError:
-            print("file not found: '{}'".format(filename))
+            log.warning("file not found: '%s'", filename)
             self.errno = 0xe2b3
             return FS100.ERROR_NO_SUCH_FILE_OR_DIRECTORY
 
         if len(context) == 0:
             raise ValueError('An empty file')
 
-        self.transmission_lock.acquire()
-        self.connect(FS100.UDP_PORT_FILE_CONTROL)
+        with FS100.transmission_lock:
+            sock = self._open_socket(self.port_file_control)
+            try:
+                CHUNK_SIZE = 400
+                block_no = 0
+                req_id = self._next_req_id()
+                data = ntpath.basename(filename).encode(encoding=FS100.ENCODING)
+                req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, 0x15, data,
+                                     len(data))
+                ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
+                while ans.status == FS100.ERROR_SUCCESS:
+                    if ans.block_no & 0x80000000 != 0:
+                        # we have sent the last piece of data and this is the final ack from controller
+                        break
+                    block_no += 1
+                    if CHUNK_SIZE * block_no >= len(context):
+                        data = context[(block_no - 1) * CHUNK_SIZE:]
+                        block_no |= 0x80000000
+                    else:
+                        data = context[(block_no - 1) * CHUNK_SIZE:block_no * CHUNK_SIZE]
+                    req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, 0x15, data,
+                                         len(data))
+                    req.ack = FS100PacketHeader.HEADER_ACK_NOT_REQUEST
+                    req.block_no = block_no
+                    ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
+                self.errno = ans.added_status
+                if ans.status != FS100.ERROR_SUCCESS:
+                    log.warning("failed sending the file, err=%s", hex(ans.added_status))
+                return ans.status
+            finally:
+                sock.close()
 
-        CHUNK_SIZE = 400
-        block_no = 0
-        data = ntpath.basename(filename).encode(encoding='utf-8')
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x15, data, len(data))
-        ans = self.transmit(req.to_bytes())
-        while ans.status == FS100.ERROR_SUCCESS:
-            if ans.block_no & 0x80000000 != 0:
-                # we have sent the last piece of data and this is the final ack from controller
-                break
-            block_no += 1
-            if CHUNK_SIZE * block_no >= len(context):
-                data = context[(block_no - 1) * CHUNK_SIZE:]
-                block_no |= 0x80000000
-            else:
-                data = context[(block_no - 1) * CHUNK_SIZE:block_no * CHUNK_SIZE]
-            req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x15, data, len(data))
-            req.ack = FS100PacketHeader.HEADER_ACK_NOT_REQUEST
-            req.block_no = block_no
-            ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed sending the file, err={}".format(hex(ans.added_status)))
+    def read_file(self, filename):
+        """Receive a file from pendant into memory
 
-        self.disconnect()
-        self.transmission_lock.release()
-        return ans.status
+        Args:
+            filename (str): Name of the file in pendant, e.g. 'TEST.JBI', 'ALMHIST.DAT' or
+                '/SPDRV/CMOSBK.BIN' for the batch data backup
+
+        Returns:
+            tuple: (status, content bytes). status is FS100.ERROR_SUCCESS for success, otherwise
+                failure and errno attribute indicates the error code.
+        """
+        return self._file_transfer("receiving the file", 0x16, filename.encode(encoding=FS100.ENCODING))
 
     def recv_file(self, filename, local_dir):
         """Receive a file from pendant
@@ -708,65 +1000,34 @@ class FS100:
                 indicates the error code.
         """
         if not os.path.isdir(local_dir):
-            print("directory not found: '{}'".format(local_dir))
+            log.warning("directory not found: '%s'", local_dir)
             self.errno = 0xe2b3
             return FS100.ERROR_NO_SUCH_FILE_OR_DIRECTORY
 
-        self.transmission_lock.acquire()
-        self.connect(FS100.UDP_PORT_FILE_CONTROL)
-
-        context = bytearray(0)
-        data = filename.encode(encoding='utf-8')
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x16, data, len(data))
-        ans = self.transmit(req.to_bytes())
-        while ans.status == FS100.ERROR_SUCCESS:
-            context += ans.data
-            req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, 0, 0, 0, 0, 0x16, bytearray(0), 0)
-            # not a request but an ack
-            req.ack = FS100PacketHeader.HEADER_ACK_NOT_REQUEST
-            req.block_no = ans.block_no
-            if ans.block_no & 0x80000000 != 0:
-                # Got the last piece of file. Send the final ack.
-                self.transmit(req.to_bytes(), FS100.TRANSMISSION_SEND)
-                break
-            else:
-                ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed receiving the file, err={}".format(hex(ans.added_status)))
-        else:
-            with open("{}/{}".format(local_dir, filename), 'wb') as f:
+        status, context = self.read_file(filename)
+        if status == FS100.ERROR_SUCCESS:
+            # basename: the controller name may carry a path such as /SPDRV/CMOSBK.BIN
+            with open(os.path.join(local_dir, ntpath.basename(filename)), 'wb') as f:
                 f.write(context)
+        return status
 
-        self.disconnect()
-        self.transmission_lock.release()
-        return ans.status
+    # ------------------------------------------------------------------ axes, position, torque
 
     def read_axis_name(self, axis_name, robot_no=101):
         """Read the name of each axis
 
         Args:
-            axis_name (dict): Where the name of each axis is stored
+            axis_name (dict): Where the name of each axis is stored ('1st_axis' to '8th_axis')
             robot_no (int, optional): Robot number. Defaults to 101 (R1 in cartesian coordinate).
 
         Returns:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x74, robot_no, 0, 0x01,
-                             bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed to read the name of each axis, err={}".format(hex(ans.added_status)))
-        else:
-            axis_name['1st_axis'] = ans.data[0:4].decode('utf-8').rstrip('\x00')
-            axis_name['2nd_axis'] = ans.data[4:8].decode('utf-8').rstrip('\x00')
-            axis_name['3rd_axis'] = ans.data[8:12].decode('utf-8').rstrip('\x00')
-            axis_name['4th_axis'] = ans.data[12:16].decode('utf-8').rstrip('\x00')
-            axis_name['5th_axis'] = ans.data[16:20].decode('utf-8').rstrip('\x00')
-            axis_name['6th_axis'] = ans.data[20:24].decode('utf-8').rstrip('\x00')
-            axis_name['7th_axis'] = ans.data[24:28].decode('utf-8').rstrip('\x00')
+        ans = self._robot_cmd("to read the name of each axis", 0x74, robot_no, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            for n, key in enumerate(_AXIS_KEYS[:len(ans.data) // 4]):
+                axis_name[key] = _cstr(ans.data[n * 4:n * 4 + 4])
         return ans.status
 
     def read_position(self, pos_info, robot_no=101):
@@ -780,50 +1041,36 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x75, robot_no, 0, 0x01,
-                             bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed reading the position info, err={}".format(hex(ans.added_status)))
-        else:
+        ans = self._robot_cmd("reading the position info", 0x75, robot_no, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
             pos_info['data_type'] = struct.unpack('<I', ans.data[0:4])[0]
             pos_info['form'] = struct.unpack('<I', ans.data[4:8])[0]
             pos_info['tool_no'] = struct.unpack('<I', ans.data[8:12])[0]
             pos_info['user_coor_no'] = struct.unpack('<I', ans.data[12:16])[0]
             pos_info['extended_form'] = struct.unpack('<I', ans.data[16:20])[0]
-            p = list()
-            for n in range(20, len(ans.data), 4):
-                p.append(struct.unpack('<i', ans.data[n:n+4])[0])
-            pos_info['pos'] = tuple(p)
+            pos_info['pos'] = tuple(_ints(ans.data[20:]))
         return ans.status
 
-    def read_position_error(self, axis_data, robot_no=1):
+    def _read_axis_values(self, what, cmd_no, robot_no, data, axes_count):
+        ans = self._robot_cmd(what, cmd_no, robot_no, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            for key, value in zip(_AXIS_KEYS[:axes_count], _ints(ans.data)):
+                data[key] = value
+        return ans.status
+
+    def read_position_error(self, axis_data, robot_no=1, axes_count=8):
         """Read the robot position error data
 
         Args:
-            axis_data (dict): Where the robot position error data is stored
+            axis_data (dict): Where the robot position error data is stored (signed pulses)
             robot_no (int, optional): Robot number. Defaults to 1.
+            axes_count (int, optional): How many axes to store. Defaults to 8.
 
         Returns:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x76, robot_no, 0, 0x01,
-                             bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed reading the position error info, err={}".format(hex(ans.added_status)))
-        else:
-            axis_data['1st_axis'] = struct.unpack('<I', ans.data[0:4])[0]
-            axis_data['2nd_axis'] = struct.unpack('<I', ans.data[4:8])[0]
-            axis_data['3rd_axis'] = struct.unpack('<I', ans.data[8:12])[0]
-            axis_data['4th_axis'] = struct.unpack('<I', ans.data[12:16])[0]
-            axis_data['5th_axis'] = struct.unpack('<I', ans.data[16:20])[0]
-            axis_data['6th_axis'] = struct.unpack('<i', ans.data[20:24])[0]
-            axis_data['7th_axis'] = struct.unpack('<i', ans.data[24:28])[0]
-        return ans.status
+        return self._read_axis_values("reading the position error info", 0x76, robot_no, axis_data, axes_count)
 
     def read_torque(self, torque_data, axes_count=7, robot_no=1):
         """Read the robot torque data of each axis
@@ -837,18 +1084,86 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x77, robot_no, 0, 0x01,
-                             bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed to read the torque data, err={}".format(hex(ans.added_status)))
-        else:
-            torque_data['1st_axis'] = struct.unpack('<i', ans.data[0:4])[0]
-            torque_data['2nd_axis'] = struct.unpack('<i', ans.data[4:8])[0]
-            torque_data['3rd_axis'] = struct.unpack('<i', ans.data[8:12])[0]
-            for num in range(4, axes_count + 1): torque_data[f'{num}th_axis'] = struct.unpack('<i', ans.data[(num - 1) * 4:num * 4])[0]
+        ans = self._robot_cmd("to read the torque data", 0x77, robot_no, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            values = _ints(ans.data)
+            torque_data['1st_axis'] = values[0]
+            torque_data['2nd_axis'] = values[1]
+            torque_data['3rd_axis'] = values[2]
+            # keys '4th_axis' .. '8th_axis' as before
+            for num in range(4, min(axes_count, len(values)) + 1):
+                torque_data[f'{num}th_axis'] = values[num - 1]
         return ans.status
+
+    def read_encoder_temperature(self, temperature, group=1, axes_count=8):
+        """Read the encoder temperature of each axis (command 0x0411, YAS4.81 and later)
+
+        Args:
+            temperature (dict): Where the values are stored ('1st_axis' ...)
+            group (int, optional): 1-8 robot R1-R8, 11-18 base B1-B8, 21-44 station S1-S24.
+                Defaults to 1.
+            axes_count (int, optional): How many axes to store. Defaults to 8.
+
+        Note:
+            The manual does not state the unit (degrees Celsius assumed). Attribute is
+            sent as 1 ("fixed to 1", p. 144) with Get_Attribute_All.
+
+        Returns:
+            int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
+                indicates the error code.
+        """
+        ans = self._robot_cmd("to read the encoder temperature", 0x0411, group, 1, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            for key, value in zip(_AXIS_KEYS[:axes_count], _ints(ans.data)):
+                temperature[key] = value
+        return ans.status
+
+    def read_regenerative_power(self, info):
+        """Read the amount of regenerative power (command 0x0412, YAS4.90 and later)
+
+        Args:
+            info (dict): Filled with 'enabled_boards' (bit mask), 'status' (0 servo off,
+                1 consuming, 2 regenerating), 'unit' (0 kWh, 1 10 Wh) and 'boards', a list of
+                dicts with 'board', 'today', 'yesterday', 'total' for every enabled board.
+
+        Returns:
+            int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
+                indicates the error code.
+        """
+        ans = self._robot_cmd("to read the regenerative power", 0x0412, 1, 1, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            data = ans.data
+            mask = struct.unpack('<I', data[0:4])[0]
+            info['enabled_boards'] = mask
+            info['status'] = data[4]
+            info['unit'] = data[5]
+            values = _ints(data[8:])
+            info['boards'] = []
+            for board in range(8):
+                if mask & (1 << board) and len(values) >= board * 3 + 3:
+                    today, yesterday, total = values[board * 3:board * 3 + 3]
+                    info['boards'].append({'board': board + 1, 'today': today, 'yesterday': yesterday,
+                                           'total': total})
+        return ans.status
+
+    def read_converter_temperature(self, board=1):
+        """Read the converter temperature of one servo board (command 0x0413, YAS5.20 and later)
+
+        Args:
+            board (int, optional): Servo board number 1 to 8. Defaults to 1.
+
+        Note:
+            The manual does not state the unit (degrees Celsius assumed).
+
+        Returns:
+            tuple: (status, temperature or None)
+        """
+        ans = self._robot_cmd("to read the converter temperature", 0x0413, board, 1, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS and len(ans.data) >= 4:
+            return ans.status, struct.unpack('<i', ans.data[0:4])[0]
+        return ans.status, None
+
+    # ------------------------------------------------------------------ variables
 
     class VarType(IntEnum):
         IO = 0x78  # 1 byte
@@ -857,10 +1172,35 @@ class FS100:
         INTEGER = 0x7b  # 2 bytes
         DOUBLE = 0x7c  # 4 bytes
         REAL = 0x7d  # 4 bytes
-        STRING = 0x7e  # max. 16 bytes
+        STRING = 0x7e  # 16 bytes
         ROBOT_POSITION = 0x7f
         BASE_POSITION = 0x80
         EXTERNAL_AXIS = 0x81
+        STRING32 = 0x8c  # 32 bytes, the same S variables with their full 32-byte length
+
+    # bytes per value on the wire
+    VAR_SIZE = {
+        VarType.IO: 1, VarType.REGISTER: 2, VarType.BYTE: 1, VarType.INTEGER: 2, VarType.DOUBLE: 4,
+        VarType.REAL: 4, VarType.STRING: 16, VarType.STRING32: 32, VarType.ROBOT_POSITION: 52,
+        VarType.BASE_POSITION: 36, VarType.EXTERNAL_AXIS: 36,
+    }
+
+    # plural commands (manual pp. 113-127, 142)
+    VAR_PLURAL_CMD = {
+        VarType.IO: 0x300, VarType.REGISTER: 0x301, VarType.BYTE: 0x302, VarType.INTEGER: 0x303,
+        VarType.DOUBLE: 0x304, VarType.REAL: 0x305, VarType.STRING: 0x306, VarType.ROBOT_POSITION: 0x307,
+        VarType.BASE_POSITION: 0x308, VarType.EXTERNAL_AXIS: 0x309, VarType.STRING32: 0x30c,
+    }
+
+    # values per plural command: (479 bytes data part - 4 bytes count) / value size,
+    # even for the 1-byte types. Matches the maxima in the manual tables (29 S, 14 S32, 9 P, 13 BP/EX).
+    VAR_PLURAL_MAX = {
+        VarType.IO: 474, VarType.REGISTER: 237, VarType.BYTE: 474, VarType.INTEGER: 237, VarType.DOUBLE: 118,
+        VarType.REAL: 118, VarType.STRING: 29, VarType.STRING32: 14, VarType.ROBOT_POSITION: 9,
+        VarType.BASE_POSITION: 13, VarType.EXTERNAL_AXIS: 13,
+    }
+
+    POSITION_TYPES = (VarType.ROBOT_POSITION, VarType.BASE_POSITION, VarType.EXTERNAL_AXIS)
 
     class Variable:
         """FS100 Variable
@@ -888,8 +1228,8 @@ class FS100:
                 self.val = struct.unpack('<i', raw_bytes[0:4])[0]
             elif self.type == FS100.VarType.REAL:
                 self.val = struct.unpack('<f', raw_bytes[0:4])[0]
-            elif self.type == FS100.VarType.STRING:
-                self.val = raw_bytes.decode('utf-8')
+            elif self.type in (FS100.VarType.STRING, FS100.VarType.STRING32):
+                self.val = _cstr(raw_bytes)
             elif self.type == FS100.VarType.ROBOT_POSITION:
                 if self.val is None: self.val = {}
                 self.val['data_type'] = struct.unpack('<I', raw_bytes[0:4])[0]
@@ -897,23 +1237,14 @@ class FS100:
                 self.val['tool_no'] = struct.unpack('<I', raw_bytes[8:12])[0]
                 self.val['user_coor_no'] = struct.unpack('<I', raw_bytes[12:16])[0]
                 self.val['extended_form'] = struct.unpack('<I', raw_bytes[16:20])[0]
-                self.val['pos'] = (struct.unpack('<i', raw_bytes[20:24])[0],
-                                   struct.unpack('<i', raw_bytes[24:28])[0],
-                                   struct.unpack('<i', raw_bytes[28:32])[0],
-                                   struct.unpack('<i', raw_bytes[32:36])[0],
-                                   struct.unpack('<i', raw_bytes[36:40])[0],
-                                   struct.unpack('<i', raw_bytes[40:44])[0],
-                                   struct.unpack('<i', raw_bytes[44:48])[0])
+                # 8 axes on the YRC1000 (13 words, p. 99)
+                self.val['pos'] = tuple(_ints(raw_bytes[20:52]))
             elif self.type in (FS100.VarType.BASE_POSITION, FS100.VarType.EXTERNAL_AXIS):
                 if self.val is None: self.val = {}
                 self.val['data_type'] = struct.unpack('<I', raw_bytes[0:4])[0]
-                self.val['1st_axis'] = struct.unpack('<i', raw_bytes[4:8])[0]
-                self.val['2nd_axis'] = struct.unpack('<i', raw_bytes[8:12])[0]
-                self.val['3rd_axis'] = struct.unpack('<i', raw_bytes[12:16])[0]
-                self.val['4th_axis'] = struct.unpack('<i', raw_bytes[16:20])[0]
-                self.val['5th_axis'] = struct.unpack('<i', raw_bytes[20:24])[0]
-                self.val['6th_axis'] = struct.unpack('<i', raw_bytes[24:28])[0]
-                self.val['7th_axis'] = struct.unpack('<i', raw_bytes[28:32])[0]
+                # 8 axes on the YRC1000 (9 words, pp. 101, 103)
+                for key, value in zip(_AXIS_KEYS, _ints(raw_bytes[4:36])):
+                    self.val[key] = value
 
         def val_to_bytes(self):
             ret = None
@@ -929,25 +1260,25 @@ class FS100:
                 ret = struct.pack('<i', self.val)
             elif self.type == FS100.VarType.REAL:
                 ret = struct.pack('<f', self.val)
-            elif self.type == FS100.VarType.STRING:
-                ret = self.val.encode(encoding='utf-8')
+            elif self.type in (FS100.VarType.STRING, FS100.VarType.STRING32):
+                size = FS100.VAR_SIZE[self.type]
+                ret = self.val.encode(encoding=FS100.ENCODING)
+                if len(ret) > size:
+                    raise ValueError('String is longer than {} bytes'.format(size))
+                # the controller expects the full fixed-size field (4 or 8 words)
+                ret += bytes(size - len(ret))
             elif self.type == FS100.VarType.ROBOT_POSITION:
-                pos = self.val['pos']
+                pos = (list(self.val['pos']) + [0] * 8)[:8]
                 ret = struct.pack('<I', self.val['data_type'])
                 ret += struct.pack('<I', self.val['form'])
                 ret += struct.pack('<I', self.val['tool_no'])
                 ret += struct.pack('<I', self.val['user_coor_no'])
                 ret += struct.pack('<I', self.val['extended_form'])
-                ret += struct.pack('<iiiiiii', pos[0], pos[1], pos[2], pos[3], pos[4], pos[5], pos[6])
+                ret += struct.pack('<8i', *pos)
             elif self.type in (FS100.VarType.BASE_POSITION, FS100.VarType.EXTERNAL_AXIS):
                 ret = struct.pack('<I', self.val['data_type'])
-                ret += struct.pack('<i', self.val['1st_axis'])
-                ret += struct.pack('<i', self.val['2nd_axis'])
-                ret += struct.pack('<i', self.val['3rd_axis'])
-                ret += struct.pack('<i', self.val['4th_axis'])
-                ret += struct.pack('<i', self.val['5th_axis'])
-                ret += struct.pack('<i', self.val['6th_axis'])
-                ret += struct.pack('<i', self.val['7th_axis'])
+                for key in _AXIS_KEYS:
+                    ret += struct.pack('<i', self.val.get(key, 0))
             return ret
 
     def read_variable(self, var):
@@ -969,22 +1300,16 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        if FS100.DEBUG:
-            print("FS100.read_variable(VarType={}, {})".format(var.type, var.num))
+        log.debug("FS100.read_variable(VarType=%s, %s)", var.type, var.num)
 
         attr = 1
         service = 0x0e
-        if var.type in (FS100.VarType.ROBOT_POSITION, FS100.VarType.BASE_POSITION, FS100.VarType.EXTERNAL_AXIS):
+        if var.type in FS100.POSITION_TYPES:
             # get all attributes
             attr = 0
             service = 0x01
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, var.type, var.num, attr, service,
-                             bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed reading the variable, err={}".format(hex(ans.added_status)))
-        else:
+        ans = self._robot_cmd("reading the variable", var.type, var.num, attr, service)
+        if ans.status == FS100.ERROR_SUCCESS:
             var.set_val(ans.data)
         return ans.status
 
@@ -1004,6 +1329,21 @@ class FS100:
         if sublist:
             yield sublist
 
+    def _plural_chunks(self, vars):
+        """Split consecutive vars of one type into chunks a plural command can carry.
+
+        1-byte types need an even count; an odd tail is returned as a single variable.
+        """
+        size_max = FS100.VAR_PLURAL_MAX[vars[0].type]
+        for start in range(0, len(vars), size_max):
+            chunk = vars[start:start + size_max]
+            if FS100.VAR_SIZE[chunk[0].type] == 1 and len(chunk) % 2 == 1:
+                if len(chunk) > 1:
+                    yield chunk[:-1]
+                yield chunk[-1:]
+            else:
+                yield chunk
+
     def _read_consecutive_variables(self, vars):
         """Read multiple consecutive robot variables (of the same type)
 
@@ -1017,7 +1357,8 @@ class FS100:
         Note:
             Value of each variable is stored in `val` attribute of each var object.
             All var objects in vars must have the same type (i.e., INTEGER) and must have
-            consecutive numbers, otherwise failure is immediately returned
+            consecutive numbers, otherwise failure is immediately returned.
+            Lists longer than one plural command can carry are split.
 
         Examples:
             >>> robot = FS100('10.0.0.2')
@@ -1029,19 +1370,11 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        if FS100.DEBUG:
-            print("FS100._read_consecutive_variables(VarType={}, list={})".format(vars[0].type if len(vars) > 0 else "", [v.num for v in vars]))
-
-        attr = 0
-        service = 0x33
-        
         if len(vars) == 0:
             raise ValueError('Input list cannot be empty')
-        
-        # first variable gives the starting number and type and single values size
+        log.debug("FS100._read_consecutive_variables(VarType=%s, list=%s)", vars[0].type, [v.num for v in vars])
+
         var = vars[0]
-        var_type_size = len(FS100.Variable(var.type, 0, 0).val_to_bytes())
-        
         if any([v.type != var.type for v in vars]):
             raise ValueError('Input list must contain var objects of the same type')
 
@@ -1049,43 +1382,36 @@ class FS100:
         if sorted(nums) != list(range(min(nums), max(nums) + 1)):
             raise ValueError('Input list must contain var objects with consecutive numbers')
 
-        # data contains number of variables to be read from the starting number
-        var_count = len(vars)
-        if var_type_size == 1 and var_count % 2 == 1:
-            # the protocol requires multiple of 2 for 1-byte variable types
-            var_count += 1
-        data = struct.pack('<I', var_count)
-
-        # plural commands start with 0x300, which is var.type + 0x288
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, var.type + 0x288, var.num, attr, service,
-                             data, len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed reading variables, err={}".format(hex(ans.added_status)))
-        else:
-            for ix, v in enumerate(vars):
+        vars = sorted(vars, key=lambda v: v.num)
+        var_type_size = FS100.VAR_SIZE[var.type]
+        ret = FS100.ERROR_SUCCESS
+        for chunk in self._plural_chunks(vars):
+            if len(chunk) == 1:
+                ret |= self.read_variable(chunk[0])
+                continue
+            # data contains number of variables to be read from the starting number
+            data = struct.pack('<I', len(chunk))
+            ans = self._robot_cmd("reading variables", FS100.VAR_PLURAL_CMD[var.type], chunk[0].num, 0, 0x33, data)
+            if ans.status != FS100.ERROR_SUCCESS:
+                ret |= ans.status
+                continue
+            for ix, v in enumerate(chunk):
                 # returned data start with 4 bytes with number of variables, then individual consecutive values follow
                 v.set_val(ans.data[4 + var_type_size * ix:4 + var_type_size * (ix + 1)])
-        return ans.status
+        return ret
 
     def read_variables(self, vars):
-        """Read multiple robot variables (of the same type)
+        """Read multiple robot variables
 
         Args:
             vars (list[FS100.Variable]): The variables being read
 
-        Raises:
-            ValueError: Empty list given or doesn't contain var objects with the same type
-
         Note:
-            Internally it will divide vars list into sublists containing var objects
-            with consecutive numbers. Then it will execute `_read_consecutive_variables`
-            method to read them from the robot in one call (using HSE plural command).
-            
+            Internally it groups vars by type and divides them into sublists containing var
+            objects with consecutive numbers. Then it executes `_read_consecutive_variables`
+            to read each sublist with HSE plural commands (as many as needed).
+
             Value of each variable is stored in `val` attribute of each var object.
-            All var objects in vars must have the same type (i.e., INTEGER), otherwise
-            failure is immediately returned
 
         Examples:
             >>> robot = FS100('10.0.0.2')
@@ -1097,19 +1423,24 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        
-        # groups list of vars to list of lists of consecutive vars
-        vars_dict = {v.num: v for v in vars}
-        keys = [k for k, v in vars_dict.items()]
-        keys_lists = [sublist for sublist in self._group_nums(keys)]
-
         ret = FS100.ERROR_SUCCESS
-        for keys_consecutive in keys_lists:
-            if len(keys_consecutive) == 1: ret |= self.read_variable(vars_dict[keys_consecutive[0]])
-            elif len(keys_consecutive) > 1 and vars_dict[keys_consecutive[0]].type == FS100.VarType.STRING:
-                for k in keys_consecutive: ret |= self.read_variable(vars_dict[k])
-            elif len(keys_consecutive) > 1: ret |= self._read_consecutive_variables([vars_dict[k] for k in keys_consecutive])
-
+        by_type = {}
+        for v in vars:
+            by_type.setdefault(v.type, []).append(v)
+        for type_vars in by_type.values():
+            # duplicates of one number are read once and copied
+            vars_dict = {}
+            for v in type_vars:
+                vars_dict.setdefault(v.num, []).append(v)
+            for keys_consecutive in self._group_nums(list(vars_dict.keys())):
+                firsts = [vars_dict[k][0] for k in keys_consecutive]
+                if len(firsts) == 1:
+                    ret |= self.read_variable(firsts[0])
+                else:
+                    ret |= self._read_consecutive_variables(firsts)
+                for k in keys_consecutive:
+                    for dup in vars_dict[k][1:]:
+                        dup.val = vars_dict[k][0].val
         return ret
 
     def write_variable(self, var):
@@ -1132,18 +1463,45 @@ class FS100:
         """
         attr = 1
         service = 0x10
-        if var.type in (FS100.VarType.ROBOT_POSITION, FS100.VarType.BASE_POSITION, FS100.VarType.EXTERNAL_AXIS):
+        if var.type in FS100.POSITION_TYPES:
             # set all attributes
             attr = 0
             service = 0x02
         data = var.val_to_bytes()
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, var.type, var.num, attr, service,
-                             data, len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed writing the variable, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("writing the variable", var.type, var.num, attr, service, data).status
+
+    def write_variables(self, vars):
+        """Write multiple consecutive robot variables of one type with plural commands
+
+        Args:
+            vars (list[FS100.Variable]): The variables, all of one type and with consecutive numbers
+
+        Raises:
+            ValueError: Empty list, mixed types or numbers not consecutive
+
+        Returns:
+            int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
+                indicates the error code.
+        """
+        if len(vars) == 0:
+            raise ValueError('Input list cannot be empty')
+        if any(v.type != vars[0].type for v in vars):
+            raise ValueError('Input list must contain var objects of the same type')
+        vars = sorted(vars, key=lambda v: v.num)
+        nums = [v.num for v in vars]
+        if nums != list(range(nums[0], nums[0] + len(nums))):
+            raise ValueError('Input list must contain var objects with consecutive numbers')
+        ret = FS100.ERROR_SUCCESS
+        for chunk in self._plural_chunks(vars):
+            if len(chunk) == 1:
+                ret |= self.write_variable(chunk[0])
+                continue
+            data = struct.pack('<I', len(chunk)) + b''.join(v.val_to_bytes() for v in chunk)
+            ret |= self._robot_cmd("writing variables", FS100.VAR_PLURAL_CMD[chunk[0].type], chunk[0].num, 0, 0x34,
+                                   data).status
+        return ret
+
+    # ------------------------------------------------------------------ system information
 
     class SystemInfoType(IntEnum):
         R1 = 11
@@ -1157,22 +1515,18 @@ class FS100:
         """Acquire system information
 
         Args:
-            type (FS100.SystemInfoType): Type of system
+            type (FS100.SystemInfoType): Type of system (11-18 R1-R8, 21-44 S1-S24, 101-108 application 1-8)
             info (dict): Where acquired information is stored
 
         Returns:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x89, type, 0, 0x01, bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed acquiring system info, err={}".format(hex(ans.added_status)))
-        else:
-            info['software_version'] = ans.data[0:24].decode('utf-8')
-            info['model'] = ans.data[24:40].decode('utf-8')
-            info['parameter_version'] = ans.data[40:48].decode('utf-8')
+        ans = self._robot_cmd("acquiring system info", 0x89, type, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            info['software_version'] = _cstr(ans.data[0:24])
+            info['model'] = _cstr(ans.data[24:40])
+            info['parameter_version'] = _cstr(ans.data[40:48])
         return ans.status
 
     class ManagementTimeType(IntEnum):
@@ -1202,20 +1556,17 @@ class FS100:
 
         Args:
             type (FS100.ManagementTimeType): Type of action
-            time (dict): Where acquired usage time is stored
+            time (dict): Where acquired usage time is stored ('start' like '2011/10/10 15:49',
+                'elapse' like '000000:00'00')
 
         Returns:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x88, type, 0, 0x01, bytearray(0), 0)
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed acquiring management time, err={}".format(hex(ans.added_status)))
-        else:
-            time['start'] = ans.data[0:16].decode('utf-8')
-            time['elapse'] = ans.data[16:28].decode('utf-8')
+        ans = self._robot_cmd("acquiring management time", 0x88, type, 0, 0x01)
+        if ans.status == FS100.ERROR_SUCCESS:
+            time['start'] = _cstr(ans.data[0:16])
+            time['elapse'] = _cstr(ans.data[16:28])
         return ans.status
 
     def show_text_on_pendant(self, text):
@@ -1231,13 +1582,8 @@ class FS100:
             int: FS100.ERROR_SUCCESS for success, otherwise failure and errno attribute
                 indicates the error code.
         """
-        data = text.encode(encoding='utf-8')
+        data = text.encode(encoding=FS100.ENCODING)
         if len(data) > 30:
             raise ValueError('Text is too long')
         data += bytearray(32 - len(data))
-        req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_ROBOT_CONTROL, 0, 0x85, 1, 1, 0x10, data, len(data))
-        ans = self.transmit(req.to_bytes())
-        self.errno = ans.added_status
-        if ans.status != FS100.ERROR_SUCCESS:
-            print("failed to show text on pendant, err={}".format(hex(ans.added_status)))
-        return ans.status
+        return self._robot_cmd("to show text on pendant", 0x85, 1, 1, 0x10, data).status
