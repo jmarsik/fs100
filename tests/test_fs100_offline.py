@@ -262,6 +262,16 @@ class TestFS100Offline(unittest.TestCase):
         self.assertEqual((status, data), (0, b''))
         self.assertEqual(b''.join(chunks), self.sim.state.files['ALL.PRM'])
 
+    def test_slow_first_block_waits_file_timeout(self):
+        # big files: the controller takes longer than the normal timeout to send the first block
+        self.sim.file_start_delay = 0.8
+        try:
+            status, data = self.robot.read_file('ALL.PRM')
+        finally:
+            self.sim.file_start_delay = 0.0
+        self.assertEqual(status, 0)
+        self.assertGreater(len(data), 479)
+
     def test_file_commands_use_file_port_when_connected(self):
         self.robot.connect()  # persistent robot control socket must not be reused for files
         files = []

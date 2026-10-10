@@ -329,9 +329,13 @@ class FS100:
     transmission_lock = threading.RLock()
 
     def __init__(self, ip, timeout=0.8, retries=0, port_robot_control=None, port_file_control=None,
-                 local_port_robot_control=None, local_port_file_control=None):
+                 local_port_robot_control=None, local_port_file_control=None, file_timeout=10.0):
         self.ip = ip
         self.timeout = timeout
+        # The first answer of a file transfer can take well over a second (YRC1000: ~1.6 s for
+        # ALL.PRM / SC.PRM). Giving up earlier abandons the transfer, and the controller then
+        # answers 0xE444 (busy) to every file command for ~47 s.
+        self.file_timeout = max(file_timeout, timeout)
         self.retries = retries
         self.port_robot_control = port_robot_control or FS100.UDP_PORT_ROBOT_CONTROL
         self.port_file_control = port_file_control or FS100.UDP_PORT_FILE_CONTROL
@@ -394,13 +398,14 @@ class FS100:
         p += bytearray(2)
         return p
 
-    def transmit(self, packet, direction=TRANSMISSION_SEND_AND_RECV, sock=None, retries=None):
+    def transmit(self, packet, direction=TRANSMISSION_SEND_AND_RECV, sock=None, retries=None, timeout=None):
         """Send one request packet and return the matching answer (FS100AnsPacket).
 
         Answers whose request ID or processing division do not match the request are
         discarded (they belong to earlier requests that timed out). On a timeout or a
         socket error an answer with status ERROR_CONNECTION is returned.
         `sock` is used by the file control commands, which run on their own socket.
+        `timeout` overrides self.timeout for this request.
         """
         # transmission_lock is a reentrant lock. Owning thread may acquire it again without blocking.
         # This prevents sending robot control command during file control transmission.
@@ -414,7 +419,7 @@ class FS100:
             try:
                 retries = self.retries if retries is None else retries
                 for attempt in range(retries + 1):
-                    ans = self._send_recv(sock, bytes(packet), direction)
+                    ans = self._send_recv(sock, bytes(packet), direction, timeout)
                     if ans is None or ans.status != FS100.ERROR_CONNECTION or ans.added_status != FS100.ERROR_CONNECTION:
                         return ans
                     if attempt < retries:
@@ -424,7 +429,7 @@ class FS100:
                 if to_disc:
                     self.disconnect()
 
-    def _send_recv(self, sock, packet, direction):
+    def _send_recv(self, sock, packet, direction, timeout=None):
         division = packet[9]
         req_id = packet[11]
         try:
@@ -434,7 +439,7 @@ class FS100:
             log.debug("PC -> FS100: %s", packet.hex())
             if direction != FS100.TRANSMISSION_SEND_AND_RECV:
                 return None
-            deadline = time.monotonic() + self.timeout
+            deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -878,7 +883,7 @@ class FS100:
                 data = name_or_filter
                 req = FS100ReqPacket(FS100PacketHeader.HEADER_DIVISION_FILE_CONTROL, req_id, 0, 0, 0, service,
                                      data, len(data))
-                ans = self.transmit(req.to_bytes(), sock=sock, retries=0)
+                ans = self.transmit(req.to_bytes(), sock=sock, retries=0, timeout=self.file_timeout)
                 while ans.status == FS100.ERROR_SUCCESS:
                     received += len(ans.data)
                     if sink is not None:

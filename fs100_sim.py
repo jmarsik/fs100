@@ -138,6 +138,7 @@ class FS100Simulator:
         self.drop_next = 0        # drop this many requests without answering
         self.delay = 0.0          # seconds to wait before answering (slow link)
         self.busy_next = 0        # answer this many file requests with 0xE444 (another transfer running)
+        self.file_start_delay = 0.0  # extra wait before the first answer of a file transfer (big files)
         self.sock_robot = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock_robot.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock_robot.bind((host, port_robot))
@@ -417,6 +418,8 @@ class FS100Simulator:
         data = req[HDR:HDR + struct.unpack_from('<H', req, 6)[0]]
         st = self.state
         if ack == 0:
+            if self.file_start_delay:
+                time.sleep(self.file_start_delay)
             if self.busy_next:
                 self.busy_next -= 1
                 return [_answer(req, service, ST_VENDOR, 0xE444)]
